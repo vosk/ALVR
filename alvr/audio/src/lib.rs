@@ -445,7 +445,7 @@ pub fn receive_samples_loop(
             Err(ConnectionError::TryAgain(_)) => continue,
             Err(ConnectionError::Other(e)) => return Err(e),
         };
-        let (_, packet) = data.get()?;
+        let (_, packet) = data.get_all()?;
 
         let new_samples = packet
             .chunks_exact(2)

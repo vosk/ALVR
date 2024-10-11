@@ -18,18 +18,18 @@
 
 use crate::backend::{tcp, udp, SocketReader, SocketWriter};
 use alvr_common::{
-    anyhow::Result, debug, parking_lot::Mutex, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
+    anyhow::{anyhow, Result}, debug, parking_lot::Mutex, warn, error, AnyhowToCon, ConResult, HandleTryAgain, ToCon
 };
 use alvr_session::{DscpTos, SocketBufferSize, SocketProtocol};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{ hash_map::Entry, HashMap, VecDeque},
     marker::PhantomData,
     mem,
     net::{IpAddr, TcpListener, UdpSocket},
     sync::{mpsc, Arc},
-    time::Duration,
+    time::Duration
 };
 
 const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
@@ -163,9 +163,32 @@ impl<H: Serialize> StreamSender<H> {
     }
 }
 
+pub struct Shard {
+    buffer: Vec<u8>,
+    start_offset: usize,
+    size: usize
+}
+impl Shard {
+    pub fn data(&self) -> &[u8] {
+        &self.buffer[self.start_offset..self.size]
+    }
+    pub fn skip(&mut self, size: usize) -> () {
+        self.start_offset += size;
+    }
+    
+    pub fn data_skip(&self, size: usize) -> &[u8] {
+        &self.buffer[self.start_offset+size..self.size]
+    }
+
+    pub fn len(&self) -> usize {
+        self.size-self.start_offset
+    }
+}
+
+
 pub struct ReceiverData<H> {
-    buffer: Option<Vec<u8>>,
-    size: usize, // counting the prefix
+    buffers: VecDeque<Shard>,
+    used_buffers: Vec<Shard>, 
     used_buffer_queue: mpsc::Sender<Vec<u8>>,
     had_packet_loss: bool,
     _phantom: PhantomData<H>,
@@ -178,30 +201,65 @@ impl<H> ReceiverData<H> {
 }
 
 impl<H: DeserializeOwned> ReceiverData<H> {
-    pub fn get(&self) -> Result<(H, &[u8])> {
-        let mut data: &[u8] = &self.buffer.as_ref().unwrap()[SHARD_PREFIX_SIZE..self.size];
-        // This will partially consume the slice, leaving only the actual payload
-        let header = bincode::deserialize_from(&mut data)?;
-
-        Ok((header, data))
+    pub fn get_all(&self) -> Result<(H, Vec<u8>)> {
+        let (header, front) = self.header()?;
+        let mut shards = Vec::new();
+        shards.push(front);
+        shards.extend(self.buffers.iter().skip(1).map(|s| s.data()));
+        Ok((header, shards.concat()))
     }
+
+    pub fn extract_header(&mut self) -> Result<H> {
+        let shard = self.buffers.front_mut().unwrap();
+        let slice = shard.data();
+        let header = bincode::deserialize_from(slice)?;
+        shard.skip( shard.len()- slice.len());
+        Ok(header)
+    }
+
+    pub fn get_shards(&self) -> Vec<&[u8]> {
+        self.buffers.iter().map(|s| s.data()).collect()
+    }
+    
+
+    pub fn header(&self) -> Result<(H, &[u8])> {
+        match self.buffers.front() {
+            Some(shard) => {
+                let slice = shard.data();
+                let header = bincode::deserialize_from(slice)?;
+                Ok((header,shard.data_skip(shard.len()- slice.len())))
+            }
+            None => Err(anyhow!("test"))
+        }        
+    }
+
     pub fn get_header(&self) -> Result<H> {
-        Ok(self.get()?.0)
+        Ok(self.header()?.0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffers.len()
     }
 }
 
 impl<H> Drop for ReceiverData<H> {
     fn drop(&mut self) {
-        self.used_buffer_queue
-            .send(self.buffer.take().unwrap())
+        while let Some(shard) = self.buffers.pop_front() {
+            self.used_buffer_queue
+            .send(shard.buffer)
             .ok();
+        }
+        while let Some(shard) =  self.used_buffers.pop() {
+            self.used_buffer_queue
+            .send(shard.buffer)
+            .ok();
+        }
     }
 }
 
 struct ReconstructedPacket {
     index: u32,
-    buffer: Vec<u8>,
-    size: usize, // contains prefix
+    buffers: VecDeque<Shard>
 }
 
 pub struct StreamReceiver<H> {
@@ -244,16 +302,20 @@ impl<H: DeserializeOwned + Serialize> StreamReceiver<H> {
                 }
                 Ordering::Less => {
                     // Old packet, discard
-                    self.used_buffer_queue.send(packet.buffer).to_con()?;
+                    let mut buffers = packet.buffers;
+                    while let Some(shard) = buffers.pop_back() {
+                        self.used_buffer_queue.send(shard.buffer).to_con()?;
+                    }
                     return alvr_common::try_again();
                 }
             }
         }
         self.last_packet_index = Some(packet.index);
 
+        // info!("Got a packet {}", packet.buffers.len());
         Ok(ReceiverData {
-            buffer: Some(packet.buffer),
-            size: packet.size,
+            buffers: packet.buffers,
+            used_buffers: vec![],
             used_buffer_queue: self.used_buffer_queue.clone(),
             had_packet_loss,
             _phantom: PhantomData,
@@ -378,15 +440,11 @@ struct RecvState {
     packet_index: u32,
     shards_count: usize,
     shard_index: usize,
-    packet_cursor: usize, // counts also the prefix bytes
-    overwritten_data_backup: Option<[u8; SHARD_PREFIX_SIZE]>,
     should_discard: bool,
 }
 
 struct InProgressPacket {
-    buffer: Vec<u8>,
-    buffer_length: usize,
-    received_shard_indices: HashSet<usize>,
+    buffers: HashMap<usize,Shard>
 }
 
 struct StreamRecvComponents {
@@ -394,7 +452,6 @@ struct StreamRecvComponents {
     used_buffer_receiver: mpsc::Receiver<Vec<u8>>,
     packet_queue: mpsc::Sender<ReconstructedPacket>,
     in_progress_packets: HashMap<u32, InProgressPacket>,
-    discarded_shards_sink: InProgressPacket,
 }
 
 // Note: used buffers don't *have* to be split by stream ID, but doing so improves memory usage
@@ -430,10 +487,6 @@ impl StreamSocket {
         let (packet_sender, packet_receiver) = mpsc::channel();
         let (used_buffer_sender, used_buffer_receiver) = mpsc::channel();
 
-        for _ in 0..max_concurrent_buffers {
-            used_buffer_sender.send(vec![]).ok();
-        }
-
         self.stream_recv_components.insert(
             stream_id,
             StreamRecvComponents {
@@ -441,11 +494,6 @@ impl StreamSocket {
                 used_buffer_receiver,
                 packet_queue: packet_sender,
                 in_progress_packets: HashMap::new(),
-                discarded_shards_sink: InProgressPacket {
-                    buffer: vec![],
-                    buffer_length: 0,
-                    received_shard_indices: HashSet::new(),
-                },
             },
         );
 
@@ -482,8 +530,6 @@ impl StreamSocket {
                 packet_index,
                 shards_count,
                 shard_index,
-                packet_cursor: 0,
-                overwritten_data_backup: None,
                 should_discard: false,
             })
         };
@@ -499,123 +545,98 @@ impl StreamSocket {
             return alvr_common::try_again();
         };
 
-        let in_progress_packet = if shard_recv_state_mut.should_discard {
-            &mut components.discarded_shards_sink
-        } else if let Some(packet) = components
-            .in_progress_packets
-            .get_mut(&shard_recv_state_mut.packet_index)
-        {
-            packet
-        } else if let Some(buffer) = components.used_buffer_receiver.try_recv().ok().or_else(|| {
-            // By default, try to dequeue a used buffer. In case none were found, recycle one of the
-            // in progress packets, chances are these buffers are "dead" because one of their shards
-            // has been dropped by the network.
-            let idx = *components.in_progress_packets.iter().next()?.0;
-            Some(components.in_progress_packets.remove(&idx).unwrap().buffer)
+        let mut available_shards = 0;
+          // Keep only shards with later packet index (using wrapping logic)
+         while let Some((idx, _)) = components.in_progress_packets.iter().find(|(idx, _)| {
+            wrapping_cmp(**idx, shard_recv_state_mut.packet_index) == Ordering::Less
         }) {
-            // NB: Can't use entry pattern because we want to allow bailing out on the line above
-            components.in_progress_packets.insert(
-                shard_recv_state_mut.packet_index,
-                InProgressPacket {
-                    buffer,
-                    buffer_length: 0,
-                    // todo: find a way to skipping this allocation
-                    received_shard_indices: HashSet::with_capacity(
-                        shard_recv_state_mut.shards_count,
-                    ),
-                },
-            );
-            components
-                .in_progress_packets
-                .get_mut(&shard_recv_state_mut.packet_index)
-                .unwrap()
-        } else {
-            // This branch may be hit in case the thread related to the stream hangs for some reason
-            shard_recv_state_mut.should_discard = true;
-            shard_recv_state_mut.packet_cursor = 0; // reset cursor from old shards
-                                                    // always write at the start of the packet so the buffer doesn't grow much
-            shard_recv_state_mut.shard_index = 0;
+            let idx = *idx; // fix borrow rule
+            let packet = components.in_progress_packets.remove(&idx).unwrap();
+            let mut values = packet.buffers.into_values().collect::<Vec<Shard>>();
+            while let Some(shard) =  values.pop() {
+                components.used_buffer_sender.send(shard.buffer).ok();
+                available_shards +=1;
+            }
+        }
+        //alocate
+        if available_shards == 0 {
+            components.used_buffer_sender.send(vec![]).ok();
+        }
 
-            &mut components.discarded_shards_sink
+        let Some(mut buffer) = components.used_buffer_receiver.try_recv().ok()
+         else {
+            error!("Couldnt get buffer");
+            return alvr_common::try_again();
         };
 
-        let max_shard_data_size = self.max_packet_size - SHARD_PREFIX_SIZE;
-        // Note: there is no prefix offset, since we want to write the prefix too.
-        let packet_start_index = shard_recv_state_mut.shard_index * max_shard_data_size;
+        let in_progress_packets = &mut components.in_progress_packets;
 
-        // Prepare buffer to accomodate receiving shard
+        let in_progress_packet = match in_progress_packets
+            .entry(shard_recv_state_mut.packet_index)
         {
-            // Note: this contains the prefix offset
-            in_progress_packet.buffer_length = usize::max(
-                in_progress_packet.buffer_length,
-                packet_start_index + shard_recv_state_mut.shard_length,
-            );
+            Entry::Occupied(entry) => { 
+                entry.into_mut() 
+            }
+            Entry::Vacant(entry) =>  { entry.insert(
+                InProgressPacket {
+                    buffers: HashMap::<usize, Shard>::with_capacity( shard_recv_state_mut.shards_count),
+                })
+            }
+        };    
+        buffer.resize(shard_recv_state_mut.shard_length, 0);
 
-            if in_progress_packet.buffer.len() < in_progress_packet.buffer_length {
-                in_progress_packet
-                    .buffer
-                    .resize(in_progress_packet.buffer_length, 0);
+
+        // This loop may bail out at any time if a timeout is reached. 
+        let mut cursor = 0;
+        while cursor < shard_recv_state_mut.shard_length {
+            match self.receive_socket.recv(&mut buffer[cursor..shard_recv_state_mut.shard_length]) {
+                Ok(v) => {
+                    cursor += v
+                } 
+                Err(e) => {
+                    warn!("recycle");
+                    components.used_buffer_sender.send(buffer).ok();
+                    return Err(e)}
             }
         }
 
-        let sub_buffer = &mut in_progress_packet.buffer[packet_start_index..];
-
-        // Read shard into the single contiguous buffer
-        {
-            // Backup the small section of bytes that will be overwritten by reading from socket.
-            if shard_recv_state_mut.overwritten_data_backup.is_none() {
-                shard_recv_state_mut.overwritten_data_backup =
-                    Some(sub_buffer[..SHARD_PREFIX_SIZE].try_into().unwrap())
-            }
-
-            // This loop may bail out at any time if a timeout is reached. This is correctly handled by
-            // the previous code.
-            while shard_recv_state_mut.packet_cursor < shard_recv_state_mut.shard_length {
-                let size = self.receive_socket.recv(
-                    &mut sub_buffer
-                        [shard_recv_state_mut.packet_cursor..shard_recv_state_mut.shard_length],
-                )?;
-                shard_recv_state_mut.packet_cursor += size;
-            }
-
-            // Restore backed up bytes
-            // Safety: overwritten_data_backup is always set just before receiving the packet
-            sub_buffer[..SHARD_PREFIX_SIZE]
-                .copy_from_slice(&shard_recv_state_mut.overwritten_data_backup.take().unwrap());
-        }
-
+        
         if !shard_recv_state_mut.should_discard {
-            in_progress_packet
-                .received_shard_indices
-                .insert(shard_recv_state_mut.shard_index);
+                in_progress_packet.buffers.insert(shard_recv_state_mut.shard_index, Shard {
+                buffer,
+                start_offset: SHARD_PREFIX_SIZE,
+                size: shard_recv_state_mut.shard_length
+            });
+        } else {
+            components.used_buffer_sender.send(buffer).ok();
         }
 
         // Check if packet is complete and send
-        if in_progress_packet.received_shard_indices.len() == shard_recv_state_mut.shards_count {
-            let size = in_progress_packet.buffer_length;
+        if in_progress_packet.buffers.len() == shard_recv_state_mut.shards_count {
+
+            let mut opt_packet = 
+                in_progress_packets
+                .remove(&shard_recv_state_mut.packet_index);
+
+            let finalized_packet = opt_packet.as_mut().unwrap();
+        
+            
+            let total = finalized_packet.buffers.len();
+            let mut shards: VecDeque<Shard> = VecDeque::<Shard>::with_capacity(finalized_packet.buffers.len());    
+    
+
+            for i in 0..total {
+                // warn!("pushing {}", i);
+                shards.push_back(finalized_packet.buffers.remove(&i).unwrap());
+            }
+
             components
                 .packet_queue
                 .send(ReconstructedPacket {
                     index: shard_recv_state_mut.packet_index,
-                    buffer: components
-                        .in_progress_packets
-                        .remove(&shard_recv_state_mut.packet_index)
-                        .unwrap()
-                        .buffer,
-                    size,
+                    buffers: shards
                 })
                 .ok();
-
-            // Keep only shards with later packet index (using wrapping logic)
-            while let Some((idx, _)) = components.in_progress_packets.iter().find(|(idx, _)| {
-                wrapping_cmp(**idx, shard_recv_state_mut.packet_index) == Ordering::Less
-            }) {
-                let idx = *idx; // fix borrow rule
-                let packet = components.in_progress_packets.remove(&idx).unwrap();
-
-                // Recycle buffer
-                components.used_buffer_sender.send(packet.buffer).ok();
-            }
         }
 
         // Mark current shard as read and allow for a new shard to be read

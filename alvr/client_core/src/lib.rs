@@ -320,7 +320,7 @@ impl ClientCoreContext {
     /// The callback should return true if the frame was successfully submitted to the decoder
     pub fn set_decoder_input_callback(
         &self,
-        callback: Box<dyn FnMut(Duration, &[u8]) -> bool + Send>,
+        callback: Box<dyn FnMut(Duration, Vec<&[u8]>) -> bool + Send>,
     ) {
         dbg_client_core!("set_decoder_input_callback");
 

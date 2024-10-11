@@ -20,7 +20,7 @@ pub struct DecoderSink {
 impl DecoderSink {
     // returns true if frame has been successfully enqueued
     #[allow(unused_variables)]
-    pub fn push_nal(&mut self, timestamp: Duration, nal: &[u8]) -> bool {
+    pub fn push_nal(&mut self, timestamp: Duration, nal: Vec<&[u8]>) -> bool {
         #[cfg(target_os = "android")]
         {
             alvr_common::show_err(self.inner.push_frame_nal(timestamp, nal)).unwrap_or(false)

@@ -49,32 +49,55 @@ unsafe impl Send for VideoDecoderSink {}
 
 impl VideoDecoderSink {
     // Block until the buffer has been written or timeout is reached. Returns false if timeout.
-    pub fn push_frame_nal(&mut self, timestamp: Duration, data: &[u8]) -> Result<bool> {
+    pub fn push_frame_nal(&mut self, timestamp: Duration, data: Vec<&[u8]>) -> Result<bool> {
         let Some(decoder) = &*self.inner.lock() else {
             // This might happen only during destruction
             return Ok(false);
         };
 
-        match decoder.dequeue_input_buffer(Duration::ZERO) {
-            Ok(DequeuedInputBufferResult::Buffer(mut buffer)) => {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        buffer.buffer_mut().as_mut_ptr().cast(),
-                        data.len(),
-                    )
-                };
+        let mut buffers = vec![];
+        while buffers.len() < data.len() && buffers.len()<=1 {
+            match decoder.dequeue_input_buffer(Duration::ZERO) {
+                Ok(DequeuedInputBufferResult::Buffer(buffer)) => {
+                    buffers.push(buffer);
+                }
+                Ok(DequeuedInputBufferResult::TryAgainLater) => break,
+                Err(e) => bail!("{e}"),
+            }
+        }
 
+        if buffers.len() == 0 {
+            return Ok(false);
+        }
+
+        let mut written_shards  = 0;
+        while let Some( mut buffer) = buffers.pop() {
+
+            let how_many_to_write = (data.len()- written_shards)/(buffers.len()+1);
+            let mut offset = 0;
+                for shard in data.iter().skip(written_shards).take(how_many_to_write) {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            shard.as_ptr(),
+                            buffer.buffer_mut().as_mut_ptr().byte_add(offset).cast(),
+                            shard.len(),
+                        );
+                       
+                    };
+                    offset += shard.len();
+                }
+               
+                let last_one = buffers.len() == 0;
+            
+                let flags: u32 = 8; //if last_one { 0 } else { 8 };
                 // NB: the function expects the timestamp in micros, but nanos is used to have
                 // complete precision, so when converted back to Duration it can compare correctly
                 // to other Durations
-                decoder.queue_input_buffer(buffer, 0, data.len(), timestamp.as_nanos() as _, 0)?;
+                decoder.queue_input_buffer(buffer, 0, offset, timestamp.as_nanos()  as _, flags)?;
+                written_shards += how_many_to_write;
 
-                Ok(true)
-            }
-            Ok(DequeuedInputBufferResult::TryAgainLater) => Ok(false),
-            Err(e) => bail!("{e}"),
         }
+        return Ok(true);
     }
 }
 
@@ -183,8 +206,7 @@ fn decoder_attempt_setup(
 
     decoder
         .start()
-        .with_context(|| format!("failed to start decoder"))?;
-
+        .with_context(|| format!("failed to start decoder"))?;   
     Ok(decoder)
 }
 
@@ -396,6 +418,8 @@ pub fn video_decoder_split(
             decoder_ready_notifier.wait(&mut decoder_lock);
         }
     }
+
+    
 
     let sink = VideoDecoderSink {
         inner: decoder_sink,

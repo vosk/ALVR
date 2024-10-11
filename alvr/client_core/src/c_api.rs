@@ -613,7 +613,7 @@ pub extern "C" fn alvr_set_decoder_input_callback(
             callback(AlvrVideoFrameData {
                 callback_context: callback_context.0,
                 timestamp_ns: timestamp.as_nanos() as u64,
-                buffer_ptr: buffer.as_ptr(),
+                buffer_ptr: buffer.concat().as_ptr(),
                 buffer_size: buffer.len() as u64,
             })
         }));

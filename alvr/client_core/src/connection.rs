@@ -63,7 +63,7 @@ pub struct ConnectionContext {
     pub tracking_sender: Mutex<Option<StreamSender<Tracking>>>,
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
-    pub decoder_callback: Mutex<Option<Box<dyn FnMut(Duration, &[u8]) -> bool + Send>>>,
+    pub decoder_callback: Mutex<Option<Box<dyn FnMut(Duration, Vec<&[u8]>) -> bool + Send>>>,
     pub head_pose_queue: RwLock<VecDeque<(Duration, Pose)>>,
     pub last_good_head_pose: RwLock<Pose>,
     pub view_params: RwLock<[ViewParams; 2]>,
@@ -275,50 +275,102 @@ fn connection_pipeline(
         move || {
             let mut stream_corrupted = true;
             while is_streaming(&ctx) {
-                let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
-                    Ok(data) => data,
+                // let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                //     Ok(data) => data,
+                //     Err(ConnectionError::TryAgain(_)) => continue,
+                //     Err(ConnectionError::Other(_)) => return,
+                // };
+                // let Ok((header, nal)) = data.get_all() else {
+                //     return;
+                // };
+
+                // if let Some(stats) = &mut *ctx.statistics_manager.lock() {
+                //     stats.report_video_packet_received(header.timestamp);
+                // }
+
+                // if header.is_idr {
+                //     stream_corrupted = false;
+                // } else if data.had_packet_loss() {
+                //     stream_corrupted = true;
+                //     if let Some(sender) = &mut *ctx.control_sender.lock() {
+                //         sender.send(&ClientControlPacket::RequestIdr).ok();
+                //     }
+                //     warn!("Network dropped video packet");
+                // }
+
+                // if !stream_corrupted || !settings.connection.avoid_video_glitching {
+                //     let submitted = ctx
+                //         .decoder_callback
+                //         .lock()
+                //         .as_mut()
+                //         .map(|callback| callback(header.timestamp, &nal, true))
+                //         .unwrap_or(false);
+
+                //     if !submitted {
+                //         stream_corrupted = true;
+                //         if let Some(sender) = &mut *ctx.control_sender.lock() {
+                //             sender.send(&ClientControlPacket::RequestIdr).ok();
+                //         }
+                //         warn!("Dropped video packet. Reason: Decoder saturation")
+                //     }
+                // } else {
+                //     if let Some(sender) = &mut *ctx.control_sender.lock() {
+                //         sender.send(&ClientControlPacket::RequestIdr).ok();
+                //     }
+                //     warn!("Dropped video packet. Reason: Waiting for IDR frame")
+                // }
+
+                match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                    Ok(mut data) => {
+                        let Ok(header) = data.extract_header() else {
+                            return;
+                        };
+        
+                        if let Some(stats) = &mut *ctx.statistics_manager.lock() {
+                            stats.report_video_packet_received(header.timestamp);
+                        }
+        
+                        if header.is_idr {
+                            stream_corrupted = false;
+                        } else if data.had_packet_loss() {
+                            stream_corrupted = true;
+                            if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
+                            warn!("Network dropped video packet");
+                        }
+        
+                        if !stream_corrupted || !settings.connection.avoid_video_glitching {
+                            let buffers = data.get_shards();
+                            
+                            // warn!("get next {} {}", data.len(), nal.len());
+                            let  submitted = ctx
+                            .decoder_callback
+                            .lock()
+                            .as_mut()
+                            .map(|callback| callback(header.timestamp, buffers))
+                            .unwrap_or(false);
+                        
+                           
+        
+                            if !submitted {
+                                stream_corrupted = true;
+                                if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                    sender.send(&ClientControlPacket::RequestIdr).ok();
+                                }
+                                warn!("Dropped video packet. Reason: Decoder saturation")
+                            }
+                        } else {
+                            if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
+                            warn!("Dropped video packet. Reason: Waiting for IDR frame")
+                        }
+
+                    },
                     Err(ConnectionError::TryAgain(_)) => continue,
                     Err(ConnectionError::Other(_)) => return,
                 };
-                let Ok((header, nal)) = data.get() else {
-                    return;
-                };
-
-                if let Some(stats) = &mut *ctx.statistics_manager.lock() {
-                    stats.report_video_packet_received(header.timestamp);
-                }
-
-                if header.is_idr {
-                    stream_corrupted = false;
-                } else if data.had_packet_loss() {
-                    stream_corrupted = true;
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Network dropped video packet");
-                }
-
-                if !stream_corrupted || !settings.connection.avoid_video_glitching {
-                    let submitted = ctx
-                        .decoder_callback
-                        .lock()
-                        .as_mut()
-                        .map(|callback| callback(header.timestamp, nal))
-                        .unwrap_or(false);
-
-                    if !submitted {
-                        stream_corrupted = true;
-                        if let Some(sender) = &mut *ctx.control_sender.lock() {
-                            sender.send(&ClientControlPacket::RequestIdr).ok();
-                        }
-                        warn!("Dropped video packet. Reason: Decoder saturation")
-                    }
-                } else {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Dropped video packet. Reason: Waiting for IDR frame")
-                }
             }
         }
     });
